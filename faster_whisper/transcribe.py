@@ -4,7 +4,7 @@ import logging
 import os
 import zlib
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from inspect import signature
 from math import ceil
 from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
@@ -107,6 +107,54 @@ class TranscriptionInfo:
     all_language_probs: Optional[List[Tuple[str, float]]]
     transcription_options: TranscriptionOptions
     vad_options: VadOptions
+
+
+@dataclass
+class TranscriptionState:
+    audio_input: Union[str, BinaryIO, np.ndarray]
+    file_id: Optional[Union[str, int]] = None
+    full_audio_waveform: Optional[np.ndarray] = None
+    sampling_rate: int = 16000
+    duration_seconds: float = 0.0
+
+    vad_enabled: bool = False
+    vad_options: Optional[VadOptions] = None
+    speech_chunks: Optional[List[dict]] = None
+    current_vad_chunk_index: int = 0
+    current_processing_audio_chunk: Optional[np.ndarray] = None
+    current_features_for_model: Optional[np.ndarray] = None
+    current_segment_offset_seconds: float = 0.0
+    current_segment_duration_seconds: float = 0.0
+
+    language: Optional[str] = None
+    language_probability: Optional[float] = None
+    all_language_probs: Optional[List[Tuple[str, float]]] = None
+    tokenizer: Optional[Tokenizer] = None
+
+    accumulated_tokens: List[int] = field(default_factory=list)
+    prompt_reset_since: int = 0
+    last_speech_timestamp: float = 0.0
+
+    current_encoder_output: Optional[ctranslate2.StorageView] = None
+    current_prompt_tokens: Optional[List[int]] = None
+
+    transcription_options: Optional[TranscriptionOptions] = None
+
+    segments: List[Segment] = field(default_factory=list)
+    transcription_info: Optional[TranscriptionInfo] = None
+
+    is_processing_complete: bool = False
+    error_occurred: bool = False
+    error_message: Optional[str] = None
+
+    current_temperature_index: int = 0
+
+    seek_frames: int = 0
+
+    seek_clips_frames: Optional[List[Tuple[int, int]]] = None
+    current_seek_clip_idx: int = 0
+
+    speech_timestamps_map: Optional[object] = None
 
 
 class BatchedInferencePipeline:
@@ -835,11 +883,23 @@ class WhisperModel:
             )
             multilingual = False
 
-        if not isinstance(audio, np.ndarray):
-            audio = decode_audio(audio, sampling_rate=sampling_rate)
+        transcription_state = TranscriptionState(
+            file_id=None,
+            audio_input=audio,
+            sampling_rate=sampling_rate,
+            vad_enabled=vad_filter,
+        )
 
-        duration = audio.shape[0] / sampling_rate
-        duration_after_vad = duration
+        if not isinstance(transcription_state.audio_input, np.ndarray):
+            transcription_state.full_audio_waveform = decode_audio(
+                audio, sampling_rate=sampling_rate
+            )
+        else:
+            transcription_state.full_audio_waveform = transcription_state.audio_input
+
+        duration = transcription_state.full_audio_waveform.shape[0] / sampling_rate
+        transcription_state.duration_seconds = duration
+        transcription_state.duration_after_vad = duration
 
         self.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
@@ -850,14 +910,24 @@ class WhisperModel:
                 vad_parameters = VadOptions()
             elif isinstance(vad_parameters, dict):
                 vad_parameters = VadOptions(**vad_parameters)
-            speech_chunks = get_speech_timestamps(audio, vad_parameters)
-            audio_chunks, chunks_metadata = collect_chunks(audio, speech_chunks)
-            audio = np.concatenate(audio_chunks, axis=0)
-            duration_after_vad = audio.shape[0] / sampling_rate
+            transcription_state.vad_options = vad_parameters
+            transcription_state.speech_chunks = get_speech_timestamps(
+                transcription_state.full_audio_waveform, vad_parameters
+            )
+            transcription_state.audio_chunks, chunks_metadata = collect_chunks(
+                transcription_state.full_audio_waveform,
+                transcription_state.speech_chunks,
+            )
+            transcription_state.full_audio_waveform = np.concatenate(
+                transcription_state.audio_chunks, axis=0
+            )
+            transcription_state.duration_after_vad = (
+                transcription_state.full_audio_waveform.shape[0] / sampling_rate
+            )
 
             self.logger.info(
                 "VAD filter removed %s of audio",
-                format_timestamp(duration - duration_after_vad),
+                format_timestamp(duration - transcription_state.duration_after_vad),
             )
 
             if self.logger.isEnabledFor(logging.DEBUG):
@@ -869,23 +939,25 @@ class WhisperModel:
                             format_timestamp(chunk["start"] / sampling_rate),
                             format_timestamp(chunk["end"] / sampling_rate),
                         )
-                        for chunk in speech_chunks
+                        for chunk in transcription_state.speech_chunks
                     ),
                 )
 
         else:
-            speech_chunks = None
+            transcription_state.speech_chunks = None
 
-        features = self.feature_extractor(audio, chunk_length=chunk_length)
+        features = self.feature_extractor(
+            transcription_state.full_audio_waveform, chunk_length=chunk_length
+        )
 
         encoder_output = None
-        all_language_probs = None
+        transcription_state.all_language_probs = None
 
         # detecting the language if not provided
         if language is None:
             if not self.model.is_multilingual:
-                language = "en"
-                language_probability = 1
+                transcription_state.language = "en"
+                transcription_state.language_probability = 1
             else:
                 start_timestamp = (
                     float(clip_timestamps.split(",")[0])
@@ -893,25 +965,25 @@ class WhisperModel:
                     else clip_timestamps[0]
                 )
                 content_frames = features.shape[-1] - 1
-                seek = (
+                transcription_state.seek_frames = (
                     int(start_timestamp * self.frames_per_second)
                     if start_timestamp * self.frames_per_second < content_frames
                     else 0
                 )
                 (
-                    language,
-                    language_probability,
-                    all_language_probs,
+                    transcription_state.language,
+                    transcription_state.language_probability,
+                    transcription_state.all_language_probs,
                 ) = self.detect_language(
-                    features=features[..., seek:],
+                    features=features[..., transcription_state.seek_frames :],
                     language_detection_segments=language_detection_segments,
                     language_detection_threshold=language_detection_threshold,
                 )
 
                 self.logger.info(
                     "Detected language '%s' with probability %.2f",
-                    language,
-                    language_probability,
+                    transcription_state.language,
+                    transcription_state.language_probability,
                 )
         else:
             if not self.model.is_multilingual and language != "en":
@@ -919,18 +991,18 @@ class WhisperModel:
                     "The current model is English-only but the language parameter is set to '%s'; "
                     "using 'en' instead." % language
                 )
-                language = "en"
+                transcription_state.language = "en"
 
-            language_probability = 1
+            transcription_state.language_probability = 1
 
         tokenizer = Tokenizer(
             self.hf_tokenizer,
             self.model.is_multilingual,
             task=task,
-            language=language,
+            language=transcription_state.language,
         )
 
-        options = TranscriptionOptions(
+        transcription_state.transcription_options = TranscriptionOptions(
             beam_size=beam_size,
             best_of=best_of,
             patience=patience,
@@ -966,20 +1038,26 @@ class WhisperModel:
         )
 
         segments = self.generate_segments(
-            features, tokenizer, options, log_progress, encoder_output
+            features,
+            tokenizer,
+            transcription_state.transcription_options,
+            log_progress,
+            encoder_output,
         )
 
-        if speech_chunks:
-            segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
+        if transcription_state.speech_chunks:
+            segments = restore_speech_timestamps(
+                segments, transcription_state.speech_chunks, sampling_rate
+            )
 
         info = TranscriptionInfo(
-            language=language,
-            language_probability=language_probability,
+            language=transcription_state.language,
+            language_probability=transcription_state.language_probability,
             duration=duration,
-            duration_after_vad=duration_after_vad,
-            transcription_options=options,
-            vad_options=vad_parameters,
-            all_language_probs=all_language_probs,
+            duration_after_vad=transcription_state.duration_after_vad,
+            transcription_options=transcription_state.transcription_options,
+            vad_options=transcription_state.vad_options,
+            all_language_probs=transcription_state.all_language_probs,
         )
 
         return segments, info
